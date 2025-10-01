@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Climate Trends Explorer</title>
+  <style>
+    :root{ --bg:#f3f6fb; --card:#fff; --accent:#0f62fe; --muted:#64748b; font-family:Inter,system-ui,Segoe UI,Roboto,Arial;}
+    body{margin:0;background:var(--bg);display:flex;align-items:center;justify-content:center;min-height:100vh;padding:28px;}
+    .card{width:920px;max-width:95vw;background:var(--card);border-radius:12px;box-shadow:0 8px 30px rgba(16,24,40,0.08);padding:18px;}
+    h1{margin:0;font-size:20px}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+    input[type="text"], input[type="date"], select{padding:8px 10px;border:1px solid #e6eef8;border-radius:8px;font-size:14px}
+    button{background:var(--accent);color:#fff;border:none;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .left{flex:1;min-width:220px}
+    .right{width:380px;min-width:260px}
+    #locations{margin-top:8px;max-height:160px;overflow:auto;padding:6px;border-radius:8px;border:1px dashed #e6eef8}
+    .loc-item{padding:6px;border-radius:6px;cursor:pointer}
+    .loc-item:hover{background:#f1f5fd}
+    .meta{color:var(--muted);font-size:13px;margin-top:8px}
+    canvas{background:#fff;border-radius:8px;padding:12px}
+    .small{font-size:13px;color:var(--muted)}
+    footer{margin-top:10px;font-size:12px;color:#94a3b8;text-align:right}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>Climate Trends Explorer</h1>
+    <div class="controls">
+      <div class="left">
+        <div style="display:flex;gap:8px">
+          <input id="city" type="text" placeholder="Enter city (e.g., Chennai)" />
+          <button id="searchBtn">Find</button>
+        </div>
+        <div id="locations" class="small"></div>
+
+        <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
+          <label class="small">From</label>
+          <input id="startDate" type="date" value="1980-01-01" />
+          <label class="small">To</label>
+          <input id="endDate" type="date" value="2020-12-31" />
+        </div>
+
+        <div style="margin-top:8px">
+          <button id="fetchBtn">Fetch Climate Data</button>
+        </div>
+
+        <div id="status" class="meta">Data: Open-Meteo climate models (1950–2050). Attribution required.</div>
+      </div>
+
+      <div class="right">
+        <div id="summary" class="small">Select a location → choose dates → fetch</div>
+        <canvas id="chart" width="380" height="240"></canvas>
+      </div>
+    </div>
+
+    <footer>Open-Meteo (CMIP6 downscaled models). For research use check sources & attribution. </footer>
+  </div>
+
+<script>
+const searchBtn = document.getElementById('searchBtn');
+const cityInput = document.getElementById('city');
+const locationsDiv = document.getElementById('locations');
+const fetchBtn = document.getElementById('fetchBtn');
+const status = document.getElementById('status');
+const summary = document.getElementById('summary');
+const startDate = document.getElementById('startDate');
+const endDate = document.getElementById('endDate');
+let selectedLocation = null;
+let chart = null;
+
+searchBtn.onclick = async () => {
+  const q = cityInput.value.trim();
+  if(!q) { locationsDiv.innerHTML = '<div class="small">Enter a city name first.</div>'; return; }
+  locationsDiv.innerHTML = '<div class="small">Searching…</div>';
+  try {
+    const res = await fetch(`/api/geocode?city=${encodeURIComponent(q)}&count=6`);
+    const json = await res.json();
+    if(!json?.results || json.results.length === 0) {
+      locationsDiv.innerHTML = '<div class="small">No results.</div>'; return;
+    }
+    locationsDiv.innerHTML = '';
+    json.results.forEach(r => {
+      const el = document.createElement('div');
+      el.className = 'loc-item';
+      el.textContent = `${r.name || r.id} ${r.admin1 ? ', '+r.admin1 : ''} ${r.country ? ', '+r.country : ''} — (${r.latitude.toFixed(3)}, ${r.longitude.toFixed(3)})`;
+      el.onclick = () => {
+        selectedLocation = r;
+        Array.from(locationsDiv.children).forEach(c => c.style.background = '');
+        el.style.background = '#eef6ff';
+        summary.textContent = `Selected: ${r.name}, ${r.country} — lat ${r.latitude}, lon ${r.longitude}`;
+      };
+      locationsDiv.appendChild(el);
+    });
+  } catch (err) {
+    locationsDiv.innerHTML = `<div class="small">Error: ${err.message||err}</div>`;
+  }
+};
+
+fetchBtn.onclick = async () => {
+  if(!selectedLocation) { summary.textContent = 'Please pick a location from results above.'; return; }
+  const s = startDate.value || '1980-01-01';
+  const e = endDate.value || '2020-12-31';
+  summary.textContent = 'Fetching climate data — this may take a few seconds for large ranges...';
+  try {
+    const url = `/api/climate?latitude=${selectedLocation.latitude}&longitude=${selectedLocation.longitude}&start_date=${s}&end_date=${e}&daily=temperature_2m_mean`;
+    const res = await fetch(url);
+    const payload = await res.json();
+
+    // flexible parsing: Open-Meteo climate returns daily under payload.daily OR payload?.data?.daily etc.
+    let daily = payload.daily || payload?.data?.daily || null;
+    if(!daily || !daily.time) {
+      // If response contains per-model entries, try to find first available model block
+      // Many Open-Meteo wrappers return {locations: [{daily: {...}}]} or different shapes — try heuristics:
+      if(Array.isArray(payload?.locations)) {
+        daily = payload.locations[0]?.daily || payload.locations[0];
+      }
+      if(!daily && payload?.results && payload.results.length) {
+        daily = payload.results[0]?.daily || payload.results[0];
+      }
+    }
+
+    if(!daily || !daily.time) { summary.textContent = 'Could not find daily.time in API response. See console.'; console.log(payload); return; }
+
+    const times = daily.time; // array of 'YYYY-MM-DD'
+    // variable keys may vary: temperature_2m_mean or temperature_2m
+    const tempKey = Object.keys(daily).find(k => k.includes('temperature_2m'));
+    const temps = daily[tempKey];
+    if(!temps) { summary.textContent = 'Temperature variable not found in daily payload.'; console.log(daily); return; }
+
+    // compute yearly averages
+    const yearly = {};
+    for(let i=0;i<times.length;i++){
+      const y = times[i].slice(0,4);
+      const v = temps[i];
+      if(v===null || v===undefined) continue;
+      (yearly[y] = yearly[y] || []).push(v);
+    }
+    const years = Object.keys(yearly).sort();
+    const avg = years.map(y => {
+      const arr = yearly[y];
+      const s = arr.reduce((a,b)=>a+b,0);
+      return +(s/arr.length).toFixed(3);
+    });
+
+    // compute simple linear trend (deg/year) and convert to deg/decade
+    const trend = linearTrend(years.map(y=>+y), avg);
+    const degPerDecade = (trend.slope * 10).toFixed(3);
+
+    summary.innerHTML = `Years: ${years[0]}–${years[years.length-1]} • Points: ${years.length} • Trend: ${degPerDecade} °C/decade (slope=${trend.slope.toFixed(5)} °C/year)`;
+
+    drawChart(years, avg, trend);
+
+  } catch (err) {
+    summary.textContent = `Fetch error: ${err.message||err}`;
+  }
+};
+
+function linearTrend(xs, ys) {
+  const n = xs.length;
+  let sumX=0,sumY=0,sumXY=0,sumXX=0;
+  for(let i=0;i<n;i++){
+    sumX+=xs[i];
+    sumY+=ys[i];
+    sumXY+=xs[i]*ys[i];
+    sumXX+=xs[i]*xs[i];
+  }
+  const slope = (n*sumXY - sumX*sumY) / (n*sumXX - sumX*sumX);
+  const intercept = (sumY - slope*sumX)/n;
+  return {slope, intercept};
+}
+
+function drawChart(labels, data, trend) {
+  const ctx = document.getElementById('chart').getContext('2d');
+  const trendLine = labels.map(y => trend.slope * (+y) + trend.intercept);
+  if(chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Yearly mean temp (°C)', data, fill:false, tension:0.2, pointRadius:2 },
+        { label: 'Linear trend', data: trendLine, fill:false, borderDash:[6,4], pointRadius:0 }
+      ]
+    },
+    options: {
+      responsive:true,
+      plugins:{ legend:{display:true} },
+      scales: {
+        x: { ticks: { maxRotation:0, minRotation:0 } },
+        y: { title: { display:true, text:'°C' } }
+      }
+    }
+  });
+}
+</script>
+</body>
+</html>
